@@ -21,9 +21,12 @@ const PAD = 12;
 export const MIN_ZOOM = 0.25;
 export const MAX_ZOOM = 8;
 const AUTO_MAX = 1.5;
-// Above this, bitmaps are rendered smaller and upscaled (keeps a single page
-// under ~128MB). Tiled rendering would lift this; see README.
-const MAX_BITMAP_PIXELS = 32e6;
+// Whole-page bitmaps are capped at this size (~64MB) and stretched beyond it.
+// Past the cap, a full-resolution "detail" bitmap covering just the visible
+// part of the page (plus a margin) is layered on top once scrolling pauses.
+const MAX_BITMAP_PIXELS = 16e6;
+const DETAIL_MARGIN = 0.35; // extra viewport fraction rendered around the visible area
+const DETAIL_SNAP = 256; // device px grid for detail rects, so small scrolls reuse them
 const MAX_BITMAP_SIDE = 16384;
 const SETTLE_MS = 180; // pinch idle time before the crisp re-render
 const TEXT_IDLE_MS = 120; // scroll idle time before building text layers
@@ -32,6 +35,10 @@ const BEHIND_VIEWPORTS = 1;
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const pageKey = (p) => `p${p}`;
+const detailKey = (p) => `d${p}`;
+// a: [x, y, w, h]; b: [x0, y0, x1, y1]
+const contains = (a, b) => a[0] <= b[0] && a[1] <= b[1] && a[0] + a[2] >= b[2] && a[1] + a[3] >= b[3];
+const intersects = (a, b) => a[0] < b[2] && a[1] < b[3] && a[0] + a[2] > b[0] && a[1] + a[3] > b[1];
 
 export class Viewer extends EventTarget {
   constructor(scroller) {
@@ -62,6 +69,8 @@ export class Viewer extends EventTarget {
     this.lastScrollTop = 0;
     this.current = 0;
     this.gesture = null;
+    this.detailJobs = [];
+    this.view = { top: 0, left: 0 };
     this.viewW = scroller.clientWidth;
     this.viewH = scroller.clientHeight;
 
@@ -210,6 +219,7 @@ export class Viewer extends EventTarget {
       this.lastScrollTop = st;
     }
     const { top, bottom, h } = this.#viewRect();
+    this.view = { top, left: this.scroller.scrollLeft };
     const a = this.pageAtY(top);
     const b = this.pageAtY(bottom);
     const ahead = AHEAD_VIEWPORTS * h;
@@ -230,7 +240,7 @@ export class Viewer extends EventTarget {
 
     // Text layers wait until scrolling pauses.
     clearTimeout(this.textTimer);
-    this.textTimer = setTimeout(() => this.#buildVisibleText(), TEXT_IDLE_MS);
+    this.textTimer = setTimeout(() => this.#onIdle(), TEXT_IDLE_MS);
 
     const cur = this.pageAtY(top + h * 0.4);
     if (cur !== this.current) {
@@ -244,11 +254,14 @@ export class Viewer extends EventTarget {
     this.mounted.set(p, m);
     const e = this.cache.touch(pageKey(p));
     if (e) this.#attach(p, m, e);
+    const d = this.cache.touch(detailKey(p));
+    if (d && d.invert === this.invert) this.#attachDetail(m, d);
   }
 
   #unmount(p) {
     const m = this.mounted.get(p);
     m.entry?.canvas.remove();
+    m.detail?.canvas.remove();
     m.cancelText?.();
     m.text?.el.remove();
     this.mounted.delete(p);
@@ -281,6 +294,13 @@ export class Viewer extends EventTarget {
     for (let p = a; p <= b; p++) visible.push(p);
     visible.sort((x, y) => Math.abs(x - this.current) - Math.abs(y - this.current));
     visible.forEach(add);
+    // Full-resolution detail for visible pages past the bitmap cap.
+    for (const job of this.detailJobs) {
+      const p = job.page - 1;
+      if (p < a || p > b || job.invert !== this.invert || job.width !== this.#fullSize(p).w) continue;
+      const vr = this.#visibleDeviceRect(p, 0);
+      if (vr && intersects(job.crop, vr)) jobs.push(job);
+    }
     if (this.dir > 0) {
       for (let p = b + 1; p <= mb; p++) add(p);
       for (let p = a - 1; p >= ma; p--) add(p);
@@ -294,6 +314,7 @@ export class Viewer extends EventTarget {
 
   onRendered(job, bitmap) {
     if (job.kind === "thumb") return this.thumbs?.onRendered(job, bitmap);
+    if (job.kind === "detail") return this.#onDetail(job, bitmap);
     const p = job.page - 1;
     const t = this.targetSize(p);
     const fits = (w, h, inv) => w === t.w && h === t.h && inv === this.invert;
@@ -310,7 +331,10 @@ export class Viewer extends EventTarget {
 
   protectedKeys() {
     const keep = new Set();
-    for (const p of this.mounted.keys()) keep.add(pageKey(p));
+    for (const [p, m] of this.mounted) {
+      keep.add(pageKey(p));
+      if (m.detail) keep.add(detailKey(p));
+    }
     if (this.thumbs) for (const k of this.thumbs.mountedKeys()) keep.add(k);
     return keep;
   }
@@ -514,7 +538,16 @@ export class Viewer extends EventTarget {
     this.layer.classList.toggle("inverted", on);
     // Until re-rendered bitmaps arrive, cached ones get a temporary CSS filter
     // so the toggle is instant.
-    for (const m of this.mounted.values()) if (m.entry) m.div.classList.toggle("inv-pending", m.entry.invert !== on);
+    for (const m of this.mounted.values()) {
+      if (m.entry) m.div.classList.toggle("inv-pending", m.entry.invert !== on);
+      if (m.detail && m.detail.invert !== on) {
+        m.detail.canvas.remove();
+        m.detail = null;
+      }
+    }
+    this.detailJobs = [];
+    clearTimeout(this.textTimer);
+    this.textTimer = setTimeout(() => this.#onIdle(), TEXT_IDLE_MS);
     this.thumbs?.setInvert(on);
     this.pool?.pump();
   }
@@ -532,6 +565,77 @@ export class Viewer extends EventTarget {
       this.texts.set(p, t);
     }
     return t;
+  }
+
+  // ---- high-zoom detail ----------------------------------------------------------
+
+  #fullSize(p) {
+    return { w: Math.round(this.w[p] * this.dpr), h: Math.round(this.h[p] * this.dpr) };
+  }
+
+  // Visible part of page p in full-resolution device px, as [x0, y0, x1, y1],
+  // optionally grown by a fraction of the viewport. Uses the scroll offsets
+  // cached by update() so it never forces layout.
+  #visibleDeviceRect(p, margin) {
+    const mx = this.viewW * margin;
+    const my = this.viewH * margin;
+    const x0 = Math.max(0, this.view.left - mx - this.lefts[p]);
+    const x1 = Math.min(this.w[p], this.view.left + this.viewW + mx - this.lefts[p]);
+    const y0 = Math.max(0, this.view.top - my - this.tops[p]);
+    const y1 = Math.min(this.h[p], this.view.top + this.viewH + my - this.tops[p]);
+    if (x1 <= x0 || y1 <= y0) return null;
+    const d = this.dpr;
+    return [Math.floor(x0 * d), Math.floor(y0 * d), Math.ceil(x1 * d), Math.ceil(y1 * d)];
+  }
+
+  // Runs once scrolling/zooming pauses: decide which visible pages need a
+  // detail render, and build text layers.
+  #onIdle() {
+    if (this.gesture) return;
+    this.#buildVisibleText();
+    const jobs = [];
+    const [a, b] = this.vis;
+    for (let p = a; p <= b; p++) {
+      const full = this.#fullSize(p);
+      if (this.targetSize(p).w >= full.w) continue; // base bitmap is already full-res
+      const vr = this.#visibleDeviceRect(p, 0);
+      if (!vr) continue;
+      const e = this.cache.get(detailKey(p));
+      if (e && e.fullW === full.w && e.invert === this.invert && contains(e.crop, vr)) continue;
+      const r = this.#visibleDeviceRect(p, DETAIL_MARGIN);
+      const x0 = Math.floor(r[0] / DETAIL_SNAP) * DETAIL_SNAP;
+      const y0 = Math.floor(r[1] / DETAIL_SNAP) * DETAIL_SNAP;
+      const x1 = Math.min(full.w, Math.ceil(r[2] / DETAIL_SNAP) * DETAIL_SNAP);
+      const y1 = Math.min(full.h, Math.ceil(r[3] / DETAIL_SNAP) * DETAIL_SNAP);
+      jobs.push({ key: detailKey(p), page: p + 1, width: full.w, height: full.h, crop: [x0, y0, x1 - x0, y1 - y0], invert: this.invert, kind: "detail" });
+    }
+    this.detailJobs = jobs;
+    if (jobs.length) this.pool?.pump();
+  }
+
+  #onDetail(job, bitmap) {
+    const p = job.page - 1;
+    if (job.width !== this.#fullSize(p).w || job.invert !== this.invert) {
+      bitmap.close(); // zoom or invert changed while rendering
+      return;
+    }
+    this.detailJobs = this.detailJobs.filter((j) => j.key !== job.key);
+    const e = this.cache.put(job.key, bitmap, { page: p, invert: job.invert, crop: job.crop, fullW: job.width, fullH: job.height });
+    const m = this.mounted.get(p);
+    if (m) this.#attachDetail(m, e);
+    this.cache.evict(this.protectedKeys());
+  }
+
+  // Positioned in percentages of the page box, so a detail from a previous
+  // zoom level stays correctly placed (just stretched) until replaced.
+  #attachDetail(m, e) {
+    if (m.detail && m.detail !== e) m.detail.canvas.remove();
+    m.detail = e;
+    const [x, y, w, h] = e.crop;
+    const c = e.canvas;
+    c.className = "detail";
+    c.style.cssText = `left:${(x / e.fullW) * 100}%;top:${(y / e.fullH) * 100}%;width:${(w / e.fullW) * 100}%;height:${(h / e.fullH) * 100}%`;
+    if (c.parentNode !== m.div) m.div.insertBefore(c, m.text ? m.text.el : null);
   }
 
   #buildVisibleText() {

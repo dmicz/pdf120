@@ -7,7 +7,7 @@
 // a worker for the most important job.
 
 let nextId = 1;
-const sig = (j) => `${j.key}|${j.width}x${j.height}|${j.invert ? 1 : 0}`;
+const sig = (j) => `${j.key}|${j.width}x${j.height}|${j.invert ? 1 : 0}|${j.crop || ""}`;
 
 export class RenderPool {
   constructor({ size, urls, provider, onRendered, onSizes }) {
@@ -142,7 +142,7 @@ export class RenderPool {
       const job = { ...list[i++], id: nextId++ };
       w.job = job;
       inflight.add(sig(job));
-      w.worker.postMessage({ type: "render", id: job.id, page: job.page, width: job.width, height: job.height, invert: job.invert });
+      w.worker.postMessage({ type: "render", id: job.id, page: job.page, width: job.width, height: job.height, crop: job.crop, invert: job.invert });
     }
   }
 

@@ -147,6 +147,40 @@ try {
   const after = await page.evaluate(() => ({ zoom: pdf120.viewer.zoom, transform: pdf120.viewer.layer.style.transform }));
   check(after.zoom > before && !after.transform, `pinch commits after settle (${before.toFixed(2)} → ${after.zoom.toFixed(2)})`);
 
+  // ---- high zoom: full-resolution detail overlay past the bitmap cap ----
+  await page.evaluate(() => {
+    const v = pdf120.viewer;
+    v.setZoom(6);
+    // Look at the top-left of the page, where the heading and body text are.
+    v.scroller.scrollTop = v.tops[v.current] + 40;
+    v.scroller.scrollLeft = v.lefts[v.current];
+  });
+  // Wait for a detail rendered at the *new* zoom (a stale one from the earlier
+  // pinch is shown stretched meanwhile, by design).
+  await page.waitForFunction(
+    () => [...document.querySelectorAll(".page canvas.detail")].some((c) => Math.abs(c.width / c.getBoundingClientRect().width - devicePixelRatio) < 0.01),
+    { timeout: 20000 },
+  ).then(
+    async () => {
+      const d = await page.evaluate(() => {
+        const v = pdf120.viewer;
+        const c = [...document.querySelectorAll(".page canvas.detail")].find((c) => Math.abs(c.width / c.getBoundingClientRect().width - devicePixelRatio) < 0.01);
+        const base = c.parentNode.querySelector("canvas:not(.detail)");
+        const r = c.getBoundingClientRect();
+        const pr = c.parentNode.getBoundingClientRect();
+        // Does the detail cover the visible part of its page?
+        const vp = v.scroller.getBoundingClientRect();
+        const covers = r.left <= Math.max(pr.left, vp.left) + 1 && r.top <= Math.max(pr.top, vp.top) + 1 && r.right >= Math.min(pr.right, vp.right) - 1 && r.bottom >= Math.min(pr.bottom, vp.bottom) - 1;
+        return { density: c.width / r.width, baseDensity: base.width / pr.width, covers };
+      });
+      check(Math.abs(d.density - 2) < 0.01, `detail renders at devicePixelRatio (${d.density.toFixed(3)} px/CSS px; capped base is ${d.baseDensity.toFixed(2)})`);
+      check(d.covers, "detail covers the visible region of the page");
+    },
+    () => check(false, "detail overlay appears at 600% zoom"),
+  );
+  await page.screenshot({ path: join(out, "03a-zoom600.png") });
+  await page.evaluate(() => pdf120.viewer.setZoom(2));
+
   // ---- invert ----
   await page.keyboard.press("i");
   await page.waitForFunction(

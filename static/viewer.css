@@ -200,6 +200,9 @@ select {
 }
 /* Bitmap rendered with the other invert setting: filter it until the
    re-render (with inversion baked in) replaces it. */
+/* Full-resolution overlay for the visible region at high zoom; positioned
+   inline in percentages of the page. */
+.page canvas.detail { inset: auto; }
 .inv-pending canvas { filter: invert(0.92) hue-rotate(180deg); }
 
 /* ---- text layer ---------------------------------------------------------- */

@@ -123,7 +123,9 @@ async function sendSizes() {
   post({ type: "sizes", sizes }, [sizes.buffer]);
 }
 
-async function render({ id, page: pageNum, width, height, invert }) {
+// width/height: full page size in device px. crop: optional [x, y, w, h]
+// sub-rectangle to render (high-zoom detail); the canvas is just that region.
+async function render({ id, page: pageNum, width, height, crop, invert }) {
   const t0 = performance.now();
   let task;
   try {
@@ -131,14 +133,17 @@ async function render({ id, page: pageNum, width, height, invert }) {
     if (!tasks.has(id)) return post({ type: "cancelled", id }); // cancelled while fetching
     const base = page.getViewport({ scale: 1 });
     const viewport = page.getViewport({ scale: width / base.width });
-    canvas.width = width;
-    canvas.height = height;
+    const [cx, cy, cw, ch] = crop || [0, 0, width, height];
+    canvas.width = cw;
+    canvas.height = ch;
+    // Map the viewport's (possibly fractional) height onto our integer page
+    // height, then shift so the crop's origin lands at (0, 0).
+    const ky = height / viewport.height;
     task = page.render({
       canvasContext: ctx,
       canvas,
       viewport,
-      // Map the viewport's (possibly fractional) height onto our integer canvas.
-      transform: height !== Math.round(viewport.height) ? [1, 0, 0, height / viewport.height, 0, 0] : null,
+      transform: ky !== 1 || cx || cy ? [1, 0, 0, ky, -cx, -cy] : null,
       intent: "display",
       annotationMode: AnnotationMode.ENABLE,
     });
@@ -147,9 +152,9 @@ async function render({ id, page: pageNum, width, height, invert }) {
     let bitmap;
     if (invert) {
       // Bake dark mode into the bitmap so the compositor never runs a filter.
-      if (!scratch) scratch = new OffscreenCanvas(width, height);
-      scratch.width = width;
-      scratch.height = height;
+      if (!scratch) scratch = new OffscreenCanvas(cw, ch);
+      scratch.width = cw;
+      scratch.height = ch;
       const sctx = scratch.getContext("2d", { alpha: false });
       sctx.filter = INVERT_FILTER;
       sctx.drawImage(canvas, 0, 0);
