@@ -1,102 +1,137 @@
 # pdf120
 
-A Chrome MV3 extension that replaces Chrome's PDF viewer. It is built for smooth 120Hz scrolling on Retina MacBooks: the main thread never rasterizes PDF content, and scrolling is fully native.
+[![CI](https://github.com/dmicz/pdf120/actions/workflows/ci.yml/badge.svg)](https://github.com/dmicz/pdf120/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/dmicz/pdf120?sort=semver)](https://github.com/dmicz/pdf120/releases/latest)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
+**A Chrome PDF viewer built for buttery 120Hz scrolling.**
+
+pdf120 replaces Chrome's built-in PDF viewer. All page rendering happens in Web Workers on `OffscreenCanvas`, and pages are displayed as pre-rendered bitmaps inside a natively scrolling, virtualized view. The main thread never rasterizes a PDF.
+
+## Features
+
+- **Smooth scrolling.** Scrolling is Chrome's native compositor scrolling. The main thread only does a binary search and the occasional DOM append.
+- **Parallel, prioritized rendering.** Several workers render pages: visible first, then pages ahead in your scroll direction, then pages behind. Renders that are no longer needed are cancelled.
+- **Sharp at any zoom.** Pages render at `devicePixelRatio`. At high zoom, a full-resolution render of the visible region is laid over the page.
+- **Instant pinch zoom.** Trackpad pinch and ⌃scroll scale the existing bitmaps with CSS while you zoom, then re-render sharply once the gesture settles.
+- **Text selection, links and ⌘F search.** Text layers are built lazily, and search matches are highlighted with the CSS Custom Highlight API.
+- **Dark mode.** The UI theme follows your system or can be set manually. Page colors can also be inverted, and the inversion is baked into the bitmaps so scrolling costs nothing extra.
+- **Thumbnails, remembered position, shortcuts.** There's a thumbnail sidebar, the last page and zoom are remembered for every file, and there are keyboard shortcuts for everything.
+- **FPS overlay and benchmark.** A frame-time overlay and a built-in scroll benchmark let you check that it holds 120fps.
+- **Works everywhere PDFs open.** It handles `http(s)` links, PDFs served from URLs without a `.pdf` extension, and local `file://` PDFs.
 
 ## Install
 
+**From a release:** download `pdf120-vX.Y.Z.zip` from [Releases](https://github.com/dmicz/pdf120/releases/latest) and unzip it.
+
+**From source:**
+
 ```sh
-npm install
-npm run build        # outputs dist/
+git clone https://github.com/dmicz/pdf120 && cd pdf120
+npm ci && npm run build      # outputs dist/
 ```
 
-1. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, and pick `dist/`.
-2. For local files, open the extension's **Details** and turn on **Allow access to file URLs**.
-3. Open any PDF link. Clicking the toolbar icon opens an empty viewer where you can drop a file.
+Then load it into Chrome (version 120 or later):
 
-`npm run watch` rebuilds when files change. After a rebuild, reload the extension.
+1. Open `chrome://extensions` and turn on **Developer mode**.
+2. Click **Load unpacked** and select the unzipped folder (or `dist/` if you built from source).
+3. To open local files, click **Details** and turn on **Allow access to file URLs**.
 
-## Architecture
-
-```
- main thread (viewer.html)              render workers (×2–3)            pdf.js parser workers
- ─────────────────────────              ───────────────────────          ─────────────────────
- native-scrolling #viewport             pdf.js display API               pdf.worker.min.mjs
-  └ sizer (full doc size)      jobs →   OffscreenCanvas 2D        ↔      (one nested per render worker)
-     └ .pages                           page.render()
-        └ .page × N placeholders  ← ImageBitmap (transferred, zero-copy)
-           └ <canvas bitmaprenderer>  (only pages near viewport)
-           └ .textLayer (lazy)
-```
-
-- **Rendering off the main thread.** Each render worker runs pdf.js with an `OffscreenCanvas`. Fonts load into the worker's own `FontFaceSet` (`ownerDocument: self`), and pdf.js gets OffscreenCanvas/no-op filter factories. A finished page is sent back with `transferToImageBitmap()`. The main thread adopts it with `bitmaprenderer.transferFromImageBitmap()`, which takes the bitmap without copying it or drawing it again.
-- **Virtualized native scrolling.** Every page has an absolutely positioned placeholder div of the right size (`contain: strict`), snapped to whole device pixels so bitmaps map 1:1. Only pages within about 1 viewport behind and 3 viewports ahead get their canvas mounted. A scroll event costs one binary search and, occasionally, a DOM append. Canvases sit on their own compositor layers, so scrolling moves textures and never re-rasters.
-- **Render queue** (`src/viewer/pool.js`). Scheduling is pull-based. On any change, the pool asks the viewer for a priority-ordered wish list: visible pages (nearest the reading position first), then pages ahead in the scroll direction, then pages behind, then sidebar thumbnails. In-flight renders that drop off the list are cancelled (`RenderTask.cancel()`), and idle workers take the head of the list. Each worker runs one job at a time, so a cancel always frees capacity for the most important page.
-- **Pinch / ctrl+wheel zoom.** During the gesture only `transform: scale()` changes on the pages layer, with the transform origin at the pointer. There's no layout and no rendering, and scheduling is paused. About 180ms after the last event, the zoom is committed: relayout, re-anchor the scroll position under the pointer, and request crisp renders. The old bitmaps stay up, stretched, until the new ones replace them.
-- **High-zoom detail.** A whole-page bitmap is capped at 16 MP (about 2× zoom on a Letter page at 2× DPR). Beyond that, the stretched whole-page bitmap is a fallback. Once scrolling pauses, a full-resolution bitmap of just the visible region is rendered and laid over it. It extends 35% of the viewport past each edge, so short scrolls stay sharp, and is snapped to a 256 px grid so small scrolls reuse it. It's positioned in percentages of the page, so after a zoom change it stays correctly placed, just stretched, until replaced. Detail renders rank right after visible pages in the queue.
-- **LRU cache** (`src/viewer/cache.js`), capped at 1.5GB (width × height × 4 bytes per entry). Mounted pages are never evicted. Thumbnails share the same budget.
-- **Lazy text layer.** Text is extracted only once scrolling pauses, and only for visible pages. It's built in `requestIdleCallback` chunks as transparent spans, laid out in PDF points and placed on the page with one CSS transform, so zooming rewrites one style per page. Link annotations become clickable areas: internal destinations scroll, external URLs open.
-- **Search** (Cmd+F) extracts text page by page in batches across the workers, yielding between batches. Matches are highlighted with the CSS Custom Highlight API, so they add no DOM.
-- **Dark mode.** The UI follows the system or a manual theme (D). Inverted page colors (I) are baked into the bitmap in the worker (`invert(0.92) hue-rotate(180deg)`), so the compositor never runs a filter while scrolling. Right after you toggle it, pages already on screen get a temporary CSS filter until their re-rendered bitmaps arrive.
-- **Interception** (`src/background.js`, `src/content.js`):
-  1. A `declarativeNetRequest` rule redirects top-level `http(s)` navigations whose path ends in `.pdf` to `viewer.html#<original URL>`, before any bytes download.
-  2. A `document_start` content script reports any top-level document whose `document.contentType` is `application/pdf`. This covers PDFs on URLs without a `.pdf` extension and `file://` URLs.
-  3. The "Open in Chrome's viewer" button and ⌘P set a per-tab bypass (a session DNR allow rule plus a flag) and go back to the original URL.
-- **Remembered position.** The page, offset within the page and zoom are stored per URL in `chrome.storage.local` (last 1000 files). A `#page=N` fragment takes precedence.
-
-## Verifying 120fps
-
-Press **Shift+D** (or click the graph icon) to open the FPS overlay. It shows:
-
-- a frame-time graph with a line at the refresh budget (green = on time, yellow = slow, red = missed vsync)
-- the detected display Hz, p99 and worst frame times, dropped frames and Long Animation Frame count
-- cache size, mounted pages, and running/queued/cancelled renders with the average render time
-
-**Bench** (Shift+B) scrolls the document at 2400 px/s for 6 seconds, driven from `requestAnimationFrame`. It reports fps and the percentage of frames that were on time.
-
-The overlay measures main-thread frames. Native trackpad scrolling runs on the compositor and can stay smooth even when the main thread hiccups, so the overlay is the stricter measure. For the compositor's own numbers, use DevTools → Rendering → **Frame Rendering Stats**. On macOS, Chrome only runs at 120Hz on ProMotion displays, and only when Low Power Mode is off.
+Open any PDF. To read a file from disk, click the toolbar icon and drop the file onto the page.
 
 ## Keyboard shortcuts
 
 | Keys | Action |
 | --- | --- |
-| J/K, N/P, ←/→ | Next / previous page |
-| Space, arrows, PgUp/PgDn | Native scroll |
-| Home / End | First / last page |
-| G | Go to page |
-| ⌘F, ⌘G / ⇧⌘G, Enter / ⇧Enter | Find, next / previous |
-| ⌘= / ⌘− / ⌘0 | Zoom in / out / automatic |
-| W / F | Fit width / fit page |
-| T | Thumbnails |
-| I | Invert page colors |
-| D | Theme: system → light → dark |
-| ⇧D / ⇧B | FPS overlay / scroll benchmark |
-| ⌘S | Download |
-| ⌘P | Print (via Chrome's viewer) |
-| ? | Help |
+| <kbd>J</kbd> / <kbd>K</kbd>, <kbd>N</kbd> / <kbd>P</kbd>, <kbd>←</kbd> / <kbd>→</kbd> | Next / previous page |
+| <kbd>Space</kbd>, arrows, <kbd>PgUp</kbd> / <kbd>PgDn</kbd> | Scroll |
+| <kbd>Home</kbd> / <kbd>End</kbd> | First / last page |
+| <kbd>G</kbd> | Go to page |
+| <kbd>⌘F</kbd>, <kbd>⌘G</kbd> / <kbd>⇧⌘G</kbd> | Find, next / previous match |
+| <kbd>⌘=</kbd> / <kbd>⌘−</kbd> / <kbd>⌘0</kbd> | Zoom in / out / automatic |
+| <kbd>W</kbd> / <kbd>F</kbd> | Fit width / fit page |
+| <kbd>T</kbd> | Thumbnail sidebar |
+| <kbd>I</kbd> | Invert page colors |
+| <kbd>D</kbd> | Theme: system → light → dark |
+| <kbd>⇧D</kbd> / <kbd>⇧B</kbd> | FPS overlay / scroll benchmark |
+| <kbd>⌘S</kbd> | Download |
+| <kbd>⌘P</kbd> | Print (hands off to Chrome's viewer) |
+| <kbd>?</kbd> | Show all shortcuts |
 
-## Testing
+On Windows and Linux, use <kbd>Ctrl</kbd> wherever this table says <kbd>⌘</kbd>.
 
-```sh
-npm run build && npm test
+## Checking 120fps
+
+Press <kbd>⇧D</kbd> to open the overlay. It shows:
+
+- a live frame-time graph against the refresh budget
+- the detected refresh rate, p99 and worst frame times, and dropped frames
+- the Long Animation Frame count
+- cache size and render queue stats
+
+Press <kbd>⇧B</kbd> to scroll through the document at constant speed for 6 seconds and report the percentage of frames that were on time.
+
+The overlay measures main-thread frames, which is the stricter test: native scrolling runs on the compositor and can stay smooth even if the main thread stutters. For the compositor's own numbers, use DevTools → Rendering → **Frame Rendering Stats**. On a MacBook, 120Hz requires a ProMotion display, and Low Power Mode must be off.
+
+## How it works
+
+```
+main thread                               render workers (2–3)        pdf.js parsers
+───────────                               ────────────────────        ──────────────
+#viewport  (native overflow scroll)       pdf.js + OffscreenCanvas    one nested worker
+ └ sizer   (full document height)  jobs → page.render()          ↔    per render worker
+    └ .page × N   placeholder divs     ←  ImageBitmap (transferred)
+       ├ <canvas> bitmaprenderer   only for pages near the viewport
+       ├ <canvas> high-zoom detail of the visible region
+       └ .textLayer               built lazily when scrolling pauses
 ```
 
-`test/smoke.mjs` uses headless Chrome (`CHROME_PATH` overrides the default macOS path). It generates a 60-page fixture, serves `dist/` as a plain page (storage falls back to `localStorage` outside the extension) and checks:
+| Piece | Where | Notes |
+| --- | --- | --- |
+| Interception | [`background.js`](src/background.js), [`content.js`](src/content.js) | A `declarativeNetRequest` rule redirects `*.pdf` navigations before they download. A `document_start` content script catches any document whose `contentType` is `application/pdf`, including `file://`. "Open in Chrome's viewer" sets a per-tab bypass. |
+| Rendering | [`render-worker.js`](src/worker/render-worker.js) | pdf.js runs in a worker with OffscreenCanvas factories, and fonts load into the worker's `FontFaceSet`. Finished pages go to the main thread through `transferToImageBitmap()`. |
+| Scheduling | [`pool.js`](src/viewer/pool.js) | Pull-based. The pool asks the viewer for a priority-ordered wish list, cancels stale in-flight renders, and gives the top of the list to idle workers. |
+| Layout & zoom | [`viewer.js`](src/viewer/viewer.js) | Page boxes snap to device pixels so bitmaps map 1:1. Pinch only changes `transform: scale()` until the gesture settles; then the layout is updated around the pointer. |
+| Cache | [`cache.js`](src/viewer/cache.js) | LRU, capped at 1.5 GB. Each entry is a `bitmaprenderer` canvas that took ownership of its ImageBitmap without a copy, so remounting a page is just a DOM append. |
+| Text & search | [`textlayer.js`](src/viewer/textlayer.js), [`find.js`](src/viewer/find.js) | Transparent spans are built in idle-time chunks and placed with a single transform per page. Search runs across pages in batches. |
+
+## Development
+
+```sh
+npm run watch    # rebuild on change (then reload the extension)
+npm test         # headless-Chrome smoke test (needs a prior build)
+npm run serve    # http://localhost:8120/viewer.html?file=/sample.pdf
+npm run zip      # package dist/ as pdf120-v<version>.zip
+```
+
+The smoke test generates a 60-page PDF and runs the viewer as a plain page. It checks:
 
 - rendering at devicePixelRatio and virtualization
 - text-layer alignment, search and highlights
-- crisp re-render after zoom, and pinch transform followed by commit
-- baked inversion, thumbnails and internal links
-- cache accounting, the remembered page, and no console errors
+- zoom and pinch, plus high-zoom detail
+- color inversion, thumbnails and internal links
+- the cache cap, the remembered position, and console errors
 
-`npm run serve` serves the same setup at `http://localhost:8120/viewer.html?file=/sample.pdf` for manual poking. `window.pdf120` exposes the viewer and pool.
+Set `CHROME_PATH` to use a different browser binary. The interception paths only run inside the installed extension, so they aren't covered by this test.
 
-The interception paths (DNR, content script, file://) need the real extension loaded and aren't covered by the automated test.
+In the viewer, `window.pdf120` exposes the viewer and the render pool for poking at from DevTools.
 
-## Limitations / next steps
+**Releasing:** bump `version` in `package.json` and commit. Then tag and push:
 
-- **Very high zoom.** Text is sharp all the way to 800%, but while you are actively scrolling at very high zoom you see the softer whole-page bitmap. The sharp overlay is rendered once scrolling pauses (about 120ms).
-- **Not supported:** forms, printing, rotation and the outline sidebar. Use "Open in Chrome's viewer" (which also handles ⌘P) for the first two.
-- **Transfer functions and HCM filters.** pdf.js implements these with SVG filters, which are unavailable in workers, so they're skipped.
-- **Re-fetching.** PDFs reached via POST, or links that force a download, are fetched again with GET. This can fail on sites that require the original request.
-- **Bypass scope.** After "Open in Chrome's viewer", the bypass lasts for the rest of that tab's life.
-- **Memory.** Each render worker parses the document separately, so memory scales with the pool size (2 workers, or 3 on machines with 8+ cores).
+```sh
+git tag v0.2.0 && git push --tags
+```
+
+CI builds and tests the tag, then publishes a GitHub release with the zip attached.
+
+## Limitations
+
+- **Not supported:** forms, printing, page rotation and the document outline. "Open in Chrome's viewer" (also <kbd>⌘P</kbd>) covers forms and printing.
+- **Softness while scrolling at very high zoom.** The sharp overlay appears about 120ms after scrolling stops. Until then you see the stretched whole-page bitmap.
+- **Missing PDF effects.** Transfer functions and high-contrast-mode filters need SVG filters, which workers don't have, so they're skipped.
+- **POST-only PDFs.** PDFs that came from a POST request are fetched again with GET, which may fail.
+- **Memory.** Each render worker parses the document on its own, so memory use grows with the pool size.
+
+## License
+
+[Apache-2.0](LICENSE). PDF rendering is powered by [pdf.js](https://github.com/mozilla/pdf.js) (Apache-2.0).

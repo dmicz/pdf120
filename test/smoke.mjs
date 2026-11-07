@@ -17,8 +17,15 @@ const out = join(root, "test/out");
 mkdirSync(fixtures, { recursive: true });
 mkdirSync(out, { recursive: true });
 
-const executablePath = process.env.CHROME_PATH || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-const browser = await puppeteer.launch({ executablePath, headless: true, args: ["--enable-gpu", "--use-angle=metal"] });
+const mac = process.platform === "darwin";
+const executablePath =
+  process.env.CHROME_PATH || (mac ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : "/usr/bin/google-chrome");
+const browser = await puppeteer.launch({
+  executablePath,
+  headless: true,
+  args: mac ? ["--enable-gpu", "--use-angle=metal"] : ["--no-sandbox", "--disable-dev-shm-usage"],
+});
+const MOD = mac ? "Meta" : "Control"; // the viewer uses ⌘ on macOS, Ctrl elsewhere
 const server = await serve(8127);
 const base = "http://localhost:8127";
 
@@ -102,9 +109,9 @@ try {
   check(geo && geo.x > 0 && geo.x < 0.3 && geo.y > 0 && geo.y < 0.2 && geo.w > 0.05, `heading span positioned near top-left (${JSON.stringify(geo)})`);
 
   // ---- find ----
-  await page.keyboard.down("Meta");
+  await page.keyboard.down(MOD);
   await page.keyboard.press("f");
-  await page.keyboard.up("Meta");
+  await page.keyboard.up(MOD);
   await page.keyboard.type("zebra47quokka");
   await page.waitForFunction(() => /1 of 1$/.test(document.getElementById("find-count").textContent), { timeout: 20000 });
   await page.waitForFunction(() => pdf120.viewer.current === 46 || pdf120.viewer.vis[0] <= 46 && pdf120.viewer.vis[1] >= 46, { timeout: 5000 });

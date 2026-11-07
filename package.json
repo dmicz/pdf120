@@ -6,9 +6,9 @@
     "build": "node scripts/build.mjs",
     "watch": "node scripts/build.mjs --watch",
     "test": "node test/smoke.mjs",
-    "serve": "node scripts/serve.mjs"
+    "serve": "node scripts/serve.mjs",
+    "zip": "npm run build && cd dist && rm -f ../pdf120-v$npm_package_version.zip && zip -qr ../pdf120-v$npm_package_version.zip . -x '*.map'"
   },
-  "author": "",
   "license": "Apache-2.0",
   "type": "module",
   "dependencies": {
@@ -18,5 +18,12 @@
     "esbuild": "^0.28.2",
     "puppeteer-core": "^25.16.0"
   },
-  "private": true
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dmicz/pdf120.git"
+  },
+  "engines": {
+    "node": ">=20"
+  }
 }

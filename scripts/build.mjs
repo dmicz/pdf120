@@ -1,6 +1,6 @@
 // Bundles the extension into dist/. Load dist/ as an unpacked extension.
 import * as esbuild from "esbuild";
-import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { makeIcons } from "./icons.mjs";
@@ -13,8 +13,12 @@ const watch = process.argv.includes("--watch");
 rmSync(dist, { recursive: true, force: true });
 mkdirSync(join(dist, "pdfjs"), { recursive: true });
 
-// Static files.
+// Static files. The manifest version is taken from package.json.
 cpSync(join(root, "static"), dist, { recursive: true });
+const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+const manifest = JSON.parse(readFileSync(join(dist, "manifest.json"), "utf8"));
+manifest.version = pkg.version;
+writeFileSync(join(dist, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 // pdf.js parser worker + resources (fonts, CMaps, wasm decoders, ICC profiles).
 cpSync(join(pdfjs, "build/pdf.worker.min.mjs"), join(dist, "pdfjs/pdf.worker.min.mjs"));
 for (const dir of ["cmaps", "standard_fonts", "wasm", "iccs"]) {
