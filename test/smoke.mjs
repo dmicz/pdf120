@@ -208,6 +208,40 @@ try {
   await page.screenshot({ path: join(out, "03a-zoom600.png") });
   await page.evaluate(() => pdf120.viewer.setZoom(2));
 
+  // Regression: pdf.js keeps a partial op-bbox recording from a cancelled
+  // render, which used to make every later tile in that worker render blank.
+  // Cancel a big full-page render mid-flight in a fresh worker, then render
+  // a tile and make sure it isn't empty.
+  const race = await page.evaluate(async () => {
+    const urls = pdf120.pool.urls;
+    const data = await (await fetch(new URLSearchParams(location.search).get("file"))).arrayBuffer();
+    const out = { cancelled: 0, blank: 0 };
+    for (const delay of [1, 3, 6, 10, 20, 40]) {
+      const w = new Worker(urls.renderWorker, { type: "module" });
+      const msgs = [];
+      w.onmessage = ({ data }) => msgs.push(data);
+      const wait = (pred) => new Promise((r) => { const f = () => { const m = msgs.find(pred); m ? r(m) : setTimeout(f, 2); }; f(); });
+      w.postMessage({ type: "init", data: data.slice(0), primary: false, urls });
+      await wait((m) => m.type === "ready");
+      w.postMessage({ type: "render", id: 1, page: 1, width: 6000, height: 7765 });
+      await new Promise((r) => setTimeout(r, delay));
+      w.postMessage({ type: "cancel", id: 1 });
+      if ((await wait((m) => m.id === 1)).type === "cancelled") out.cancelled++;
+      w.postMessage({ type: "render", id: 2, page: 1, width: 1200, height: 1553, crop: [0, 0, 1200, 1553] });
+      const r = await wait((m) => m.id === 2);
+      const c = new OffscreenCanvas(r.bitmap.width, r.bitmap.height);
+      const x = c.getContext("2d");
+      x.drawImage(r.bitmap, 0, 0);
+      const d = x.getImageData(0, 0, c.width, c.height).data;
+      let ink = 0;
+      for (let i = 0; i < d.length; i += 4) if (d[i] < 200) ink++;
+      if (!ink) out.blank++;
+      w.terminate();
+    }
+    return out;
+  });
+  check(race.cancelled > 0 && race.blank === 0, `tiles render after a cancelled first render (${race.cancelled} cancelled mid-render, ${race.blank} blank tiles)`);
+
   // ---- invert ----
   await page.keyboard.press("i");
   await page.waitForFunction(

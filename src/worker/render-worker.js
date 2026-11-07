@@ -125,13 +125,18 @@ async function sendSizes() {
 
 // Per-operation bounding boxes (recorded by pdf.js, normalized to the page)
 // let a tile render skip every drawing operation that doesn't touch it, so a
-// tile of a 78k-operation map costs a fraction of a full render. pdf.js only
-// records them on an uncropped render, so when a tile arrives first we record
-// them with a cheap low-resolution pass, once per page per worker.
-const bboxPasses = new Map();
+// tile of a 78k-operation map costs a fraction of a full render. They're
+// recorded by one dedicated low-resolution pass per page per worker, which is
+// never cancelled.
+//
+// Only that pass may record: pdf.js stores whatever was recorded so far even
+// when a render is cancelled or fails, and a partial recording marks most
+// operations as empty, so tiles culled with it come out blank. We keep our
+// own copy of the result, and only from a pass that completed.
+const bboxPasses = new Map(); // page number -> Promise<BBoxReader | null>
+const bboxes = new Map(); // page number -> BBoxReader | null (null: render tiles unculled)
 let useTileFilter = true; // debug switch: {type:"config", tileFilter:false}
 function ensureBBoxes(page, pageNum) {
-  if (page.recordedBBoxes) return Promise.resolve();
   let pass = bboxPasses.get(pageNum);
   if (!pass) {
     const base = page.getViewport({ scale: 1 });
@@ -140,15 +145,21 @@ function ensureBBoxes(page, pageNum) {
     const c = new OffscreenCanvas(Math.max(1, Math.ceil(viewport.width)), Math.max(1, Math.ceil(viewport.height)));
     pass = page
       .render({ canvasContext: c.getContext("2d"), canvas: c, viewport, intent: "display", annotationMode: AnnotationMode.ENABLE, recordOperations: true })
-      .promise.catch(() => {})
-      .finally(() => (c.width = c.height = 0));
+      .promise.then(
+        () => page.recordedBBoxes,
+        () => null,
+      )
+      .then((bb) => {
+        bboxes.set(pageNum, bb || null);
+        c.width = c.height = 0;
+      });
     bboxPasses.set(pageNum, pass);
   }
   return pass;
 }
 
-function tileFilter(page, [cx, cy, cw, ch], width, height) {
-  const bb = page.recordedBBoxes;
+function tileFilter(pageNum, [cx, cy, cw, ch], width, height) {
+  const bb = bboxes.get(pageNum);
   if (!bb) return null;
   const minX = cx / width;
   const minY = cy / height;
@@ -182,9 +193,7 @@ async function render({ id, page: pageNum, width, height, crop, invert }) {
       transform: ky !== 1 || cx || cy ? [1, 0, 0, ky, -cx, -cy] : null,
       intent: "display",
       annotationMode: AnnotationMode.ENABLE,
-      // Full-page renders record bboxes (first time only); tiles use them.
-      recordOperations: !crop,
-      operationsFilter: crop && useTileFilter ? tileFilter(page, crop, width, height) : null,
+      operationsFilter: crop && useTileFilter ? tileFilter(pageNum, crop, width, height) : null,
     });
     tasks.set(id, task);
     await task.promise;
