@@ -1,0 +1,22 @@
+{
+  "name": "pdf120",
+  "version": "0.1.0",
+  "description": "Chrome MV3 PDF viewer tuned for 120Hz scrolling: pdf.js rendering in workers via OffscreenCanvas, virtualized native scrolling, LRU bitmap cache.",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "watch": "node scripts/build.mjs --watch",
+    "test": "node test/smoke.mjs",
+    "serve": "node scripts/serve.mjs"
+  },
+  "author": "",
+  "license": "Apache-2.0",
+  "type": "module",
+  "dependencies": {
+    "pdfjs-dist": "^6.5.438"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "puppeteer-core": "^25.16.0"
+  },
+  "private": true
+}
