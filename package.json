@@ -1,6 +1,6 @@
 {
   "name": "pdf120",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Chrome MV3 PDF viewer tuned for 120Hz scrolling: pdf.js rendering in workers via OffscreenCanvas, virtualized native scrolling, LRU bitmap cache.",
   "scripts": {
     "build": "node scripts/build.mjs",
