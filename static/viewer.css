@@ -200,9 +200,10 @@ select {
 }
 /* Bitmap rendered with the other invert setting: filter it until the
    re-render (with inversion baked in) replaces it. */
-/* Full-resolution overlay for the visible region at high zoom; positioned
-   inline in percentages of the page. */
-.page canvas.detail { inset: auto; }
+/* Full-resolution tiles at high zoom, positioned inline in percentages of the
+   page. Tiles left over from a previous zoom level sit underneath. */
+.page canvas.tile { inset: auto; z-index: 1; }
+.page canvas.tile.stale { z-index: 0; }
 .inv-pending canvas { filter: invert(0.92) hue-rotate(180deg); }
 
 /* ---- text layer ---------------------------------------------------------- */
@@ -216,7 +217,7 @@ select {
   text-size-adjust: none;
   forced-color-adjust: none;
   contain: strict;
-  z-index: 1;
+  z-index: 2;
 }
 .textLayer span, .textLayer br {
   position: absolute;

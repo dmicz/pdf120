@@ -130,7 +130,9 @@ async function openDocument(data, { key, name, src }) {
   const viewer = new Viewer(scroller);
   const cores = navigator.hardwareConcurrency || 4;
   const pool = new RenderPool({
-    size: cores >= 8 ? 3 : 2,
+    // Leave headroom for the main thread, compositor and the pdf.js parser
+    // workers: 2 workers on 4–6 cores, 4 on 10+.
+    size: Math.min(4, Math.max(2, Math.floor(cores / 2) - 1)),
     urls,
     provider: () => viewer.wanted(),
     onRendered: (job, bitmap) => viewer.onRendered(job, bitmap),
@@ -238,7 +240,7 @@ async function openDocument(data, { key, name, src }) {
     scroller.focus({ preventScroll: true });
   });
 
-  const STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5, 6, 8];
+  const STEPS = [0.05, 0.08, 0.1, 0.15, 0.2, 0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5, 6, 8];
   const zoomStep = (dir) => {
     const z = viewer.zoom;
     const next = dir > 0 ? STEPS.find((s) => s > z + 0.001) : [...STEPS].reverse().find((s) => s < z - 0.001);

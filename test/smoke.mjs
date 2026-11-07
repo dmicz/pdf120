@@ -154,7 +154,7 @@ try {
   const after = await page.evaluate(() => ({ zoom: pdf120.viewer.zoom, transform: pdf120.viewer.layer.style.transform }));
   check(after.zoom > before && !after.transform, `pinch commits after settle (${before.toFixed(2)} → ${after.zoom.toFixed(2)})`);
 
-  // ---- high zoom: full-resolution detail overlay past the bitmap cap ----
+  // ---- high zoom: full-resolution tiles past the bitmap cap ----
   await page.evaluate(() => {
     const v = pdf120.viewer;
     v.setZoom(6);
@@ -162,29 +162,49 @@ try {
     v.scroller.scrollTop = v.tops[v.current] + 40;
     v.scroller.scrollLeft = v.lefts[v.current];
   });
-  // Wait for a detail rendered at the *new* zoom (a stale one from the earlier
-  // pinch is shown stretched meanwhile, by design).
+  // Fraction of the visible page area covered by current-zoom tiles.
+  const tileCoverage = () =>
+    page.evaluate(() => {
+      const vp = pdf120.viewer.scroller.getBoundingClientRect();
+      const ix = (r) => Math.max(0, Math.min(r.right, vp.right) - Math.max(r.left, vp.left)) * Math.max(0, Math.min(r.bottom, vp.bottom) - Math.max(r.top, vp.top));
+      let total = 0;
+      let got = 0;
+      for (const pg of document.querySelectorAll(".page")) total += ix(pg.getBoundingClientRect());
+      for (const c of document.querySelectorAll(".page canvas.tile:not(.stale)")) got += ix(c.getBoundingClientRect());
+      return total ? got / total : 0;
+    });
   await page.waitForFunction(
-    () => [...document.querySelectorAll(".page canvas.detail")].some((c) => Math.abs(c.width / c.getBoundingClientRect().width - devicePixelRatio) < 0.01),
+    () => {
+      const vp = pdf120.viewer.scroller.getBoundingClientRect();
+      const ix = (r) => Math.max(0, Math.min(r.right, vp.right) - Math.max(r.left, vp.left)) * Math.max(0, Math.min(r.bottom, vp.bottom) - Math.max(r.top, vp.top));
+      let total = 0;
+      let got = 0;
+      for (const pg of document.querySelectorAll(".page")) total += ix(pg.getBoundingClientRect());
+      for (const c of document.querySelectorAll(".page canvas.tile:not(.stale)")) got += ix(c.getBoundingClientRect());
+      return total && got / total > 0.999;
+    },
     { timeout: 20000 },
   ).then(
     async () => {
       const d = await page.evaluate(() => {
-        const v = pdf120.viewer;
-        const c = [...document.querySelectorAll(".page canvas.detail")].find((c) => Math.abs(c.width / c.getBoundingClientRect().width - devicePixelRatio) < 0.01);
-        const base = c.parentNode.querySelector("canvas:not(.detail)");
-        const r = c.getBoundingClientRect();
-        const pr = c.parentNode.getBoundingClientRect();
-        // Does the detail cover the visible part of its page?
-        const vp = v.scroller.getBoundingClientRect();
-        const covers = r.left <= Math.max(pr.left, vp.left) + 1 && r.top <= Math.max(pr.top, vp.top) + 1 && r.right >= Math.min(pr.right, vp.right) - 1 && r.bottom >= Math.min(pr.bottom, vp.bottom) - 1;
-        return { density: c.width / r.width, baseDensity: base.width / pr.width, covers };
+        const c = document.querySelector(".page canvas.tile:not(.stale)");
+        const base = c.parentNode.querySelector("canvas:not(.tile)");
+        return { density: c.width / c.getBoundingClientRect().width, baseDensity: base.width / c.parentNode.getBoundingClientRect().width };
       });
-      check(Math.abs(d.density - 2) < 0.01, `detail renders at devicePixelRatio (${d.density.toFixed(3)} px/CSS px; capped base is ${d.baseDensity.toFixed(2)})`);
-      check(d.covers, "detail covers the visible region of the page");
+      check(Math.abs(d.density - 2) < 0.01, `tiles render at devicePixelRatio (${d.density.toFixed(3)} px/CSS px; capped base is ${d.baseDensity.toFixed(2)})`);
+      check(true, "tiles cover the visible area at 600% zoom");
     },
-    () => check(false, "detail overlay appears at 600% zoom"),
+    () => check(false, "tiles cover the visible area at 600% zoom"),
   );
+  // Pan without pausing: tiles should keep up rather than waiting for idle.
+  const samples = [];
+  for (let i = 0; i < 30; i++) {
+    await page.evaluate(() => (pdf120.viewer.scroller.scrollTop += 60));
+    await new Promise((r) => setTimeout(r, 16));
+    samples.push(await tileCoverage());
+  }
+  const meanCov = samples.reduce((a, b) => a + b, 0) / samples.length;
+  check(meanCov > 0.9, `tiles keep up while panning (mean sharp coverage ${(meanCov * 100).toFixed(1)}%)`);
   await page.screenshot({ path: join(out, "03a-zoom600.png") });
   await page.evaluate(() => pdf120.viewer.setZoom(2));
 

@@ -12,7 +12,7 @@ pdf120 replaces Chrome's built-in PDF viewer. All page rendering happens in Web 
 
 - **Smooth scrolling.** Scrolling is Chrome's native compositor scrolling. The main thread only does a binary search and the occasional DOM append.
 - **Parallel, prioritized rendering.** Several workers render pages: visible first, then pages ahead in your scroll direction, then pages behind. Renders that are no longer needed are cancelled.
-- **Sharp at any zoom.** Pages render at `devicePixelRatio`. At high zoom, a full-resolution render of the visible region is laid over the page.
+- **Sharp at any zoom, even while panning.** Pages render at `devicePixelRatio`. Above about 2× zoom, the page is covered with full-resolution 512px tiles that render while you pan; each tile draws only the operations that touch it.
 - **Instant pinch zoom.** Trackpad pinch and ⌃scroll scale the existing bitmaps with CSS while you zoom, then re-render sharply once the gesture settles.
 - **Text selection, links and ⌘F search.** Text layers are built lazily, and search matches are highlighted with the CSS Custom Highlight API.
 - **Dark mode.** The UI theme follows your system or can be set manually. Page colors can also be inverted, and the inversion is baked into the bitmaps so scrolling costs nothing extra.
@@ -82,7 +82,7 @@ main thread                               render workers (2–3)        pdf.js p
  └ sizer   (full document height)  jobs → page.render()          ↔    per render worker
     └ .page × N   placeholder divs     ←  ImageBitmap (transferred)
        ├ <canvas> bitmaprenderer   only for pages near the viewport
-       ├ <canvas> high-zoom detail of the visible region
+       ├ <canvas> × tiles  full-res 512px tiles at high zoom
        └ .textLayer               built lazily when scrolling pauses
 ```
 
@@ -92,6 +92,7 @@ main thread                               render workers (2–3)        pdf.js p
 | Rendering | [`render-worker.js`](src/worker/render-worker.js) | pdf.js runs in a worker with OffscreenCanvas factories, and fonts load into the worker's `FontFaceSet`. Finished pages go to the main thread through `transferToImageBitmap()`. |
 | Scheduling | [`pool.js`](src/viewer/pool.js) | Pull-based. The pool asks the viewer for a priority-ordered wish list, cancels stale in-flight renders, and gives the top of the list to idle workers. |
 | Layout & zoom | [`viewer.js`](src/viewer/viewer.js) | Page boxes snap to device pixels so bitmaps map 1:1. Pinch only changes `transform: scale()` until the gesture settles; then the layout is updated around the pointer. |
+| High-zoom tiles | [`viewer.js`](src/viewer/viewer.js), [`render-worker.js`](src/worker/render-worker.js) | A whole-page bitmap is capped at 16 MP and shown stretched as a fallback. Above the cap, 512px tiles cover the viewport plus a prefetch ring half a viewport deep. Visible tiles render first, nearest the center. Tiles leaving the ring are cancelled, and cached tiles make panning back instant. Each worker records a bounding box for every PDF drawing operation once, with a cheap low-res pass. Each tile then draws only the operations that touch it, which on a 78k-operation map takes a tile from about 16ms to about 1ms. |
 | Cache | [`cache.js`](src/viewer/cache.js) | LRU, capped at 1.5 GB. Each entry is a `bitmaprenderer` canvas that took ownership of its ImageBitmap without a copy, so remounting a page is just a DOM append. |
 | Text & search | [`textlayer.js`](src/viewer/textlayer.js), [`find.js`](src/viewer/find.js) | Transparent spans are built in idle-time chunks and placed with a single transform per page. Search runs across pages in batches. |
 
@@ -102,13 +103,14 @@ npm run watch    # rebuild on change (then reload the extension)
 npm test         # headless-Chrome smoke test (needs a prior build)
 npm run serve    # http://localhost:8120/viewer.html?file=/sample.pdf
 npm run zip      # package dist/ as pdf120-v<version>.zip
+node test/pan.mjs map.pdf [zoom] [px/s] [x] [y]   # panning benchmark for big pages
 ```
 
 The smoke test generates a 60-page PDF and runs the viewer as a plain page. It checks:
 
 - rendering at devicePixelRatio and virtualization
 - text-layer alignment, search and highlights
-- zoom and pinch, plus high-zoom detail
+- zoom and pinch, plus high-zoom tiles staying sharp while panning
 - color inversion, thumbnails and internal links
 - the cache cap, the remembered position, and console errors
 
@@ -127,7 +129,6 @@ CI builds and tests the tag, then publishes a GitHub release with the zip attach
 ## Limitations
 
 - **Not supported:** forms, printing, page rotation and the document outline. "Open in Chrome's viewer" (also <kbd>⌘P</kbd>) covers forms and printing.
-- **Softness while scrolling at very high zoom.** The sharp overlay appears about 120ms after scrolling stops. Until then you see the stretched whole-page bitmap.
 - **Missing PDF effects.** Transfer functions and high-contrast-mode filters need SVG filters, which workers don't have, so they're skipped.
 - **POST-only PDFs.** PDFs that came from a POST request are fetched again with GET, which may fail.
 - **Memory.** Each render worker parses the document on its own, so memory use grows with the pool size.

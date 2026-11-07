@@ -166,6 +166,11 @@ export class RenderPool {
     });
   }
 
+  // Debug/benchmark knobs, broadcast to every worker (e.g. {tileFilter:false}).
+  configure(opts) {
+    for (const w of this.workers) w.worker.postMessage({ type: "config", ...opts });
+  }
+
   destroy() {
     for (const w of this.workers) w.worker.terminate();
     this.workers = [];

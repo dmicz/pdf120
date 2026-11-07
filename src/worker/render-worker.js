@@ -123,14 +123,50 @@ async function sendSizes() {
   post({ type: "sizes", sizes }, [sizes.buffer]);
 }
 
+// Per-operation bounding boxes (recorded by pdf.js, normalized to the page)
+// let a tile render skip every drawing operation that doesn't touch it, so a
+// tile of a 78k-operation map costs a fraction of a full render. pdf.js only
+// records them on an uncropped render, so when a tile arrives first we record
+// them with a cheap low-resolution pass, once per page per worker.
+const bboxPasses = new Map();
+let useTileFilter = true; // debug switch: {type:"config", tileFilter:false}
+function ensureBBoxes(page, pageNum) {
+  if (page.recordedBBoxes) return Promise.resolve();
+  let pass = bboxPasses.get(pageNum);
+  if (!pass) {
+    const base = page.getViewport({ scale: 1 });
+    const scale = Math.min(1024 / base.width, 1024 / base.height);
+    const viewport = page.getViewport({ scale });
+    const c = new OffscreenCanvas(Math.max(1, Math.ceil(viewport.width)), Math.max(1, Math.ceil(viewport.height)));
+    pass = page
+      .render({ canvasContext: c.getContext("2d"), canvas: c, viewport, intent: "display", annotationMode: AnnotationMode.ENABLE, recordOperations: true })
+      .promise.catch(() => {})
+      .finally(() => (c.width = c.height = 0));
+    bboxPasses.set(pageNum, pass);
+  }
+  return pass;
+}
+
+function tileFilter(page, [cx, cy, cw, ch], width, height) {
+  const bb = page.recordedBBoxes;
+  if (!bb) return null;
+  const minX = cx / width;
+  const minY = cy / height;
+  const maxX = (cx + cw) / width;
+  const maxY = (cy + ch) / height;
+  // Same test pdf.js's own viewer uses for partial (detail) renders.
+  return (i) => !bb.isEmpty(i) && bb.minX(i) <= maxX && bb.maxX(i) >= minX && bb.minY(i) <= maxY && bb.maxY(i) >= minY;
+}
+
 // width/height: full page size in device px. crop: optional [x, y, w, h]
-// sub-rectangle to render (high-zoom detail); the canvas is just that region.
+// sub-rectangle to render (a high-zoom tile); the canvas is just that region.
 async function render({ id, page: pageNum, width, height, crop, invert }) {
   const t0 = performance.now();
   let task;
   try {
     const page = await doc.getPage(pageNum);
-    if (!tasks.has(id)) return post({ type: "cancelled", id }); // cancelled while fetching
+    if (crop) await ensureBBoxes(page, pageNum);
+    if (!tasks.has(id)) return post({ type: "cancelled", id }); // cancelled while waiting
     const base = page.getViewport({ scale: 1 });
     const viewport = page.getViewport({ scale: width / base.width });
     const [cx, cy, cw, ch] = crop || [0, 0, width, height];
@@ -146,6 +182,9 @@ async function render({ id, page: pageNum, width, height, crop, invert }) {
       transform: ky !== 1 || cx || cy ? [1, 0, 0, ky, -cx, -cy] : null,
       intent: "display",
       annotationMode: AnnotationMode.ENABLE,
+      // Full-page renders record bboxes (first time only); tiles use them.
+      recordOperations: !crop,
+      operationsFilter: crop && useTileFilter ? tileFilter(page, crop, width, height) : null,
     });
     tasks.set(id, task);
     await task.promise;
@@ -247,6 +286,9 @@ self.onmessage = ({ data: msg }) => {
     }
     case "text":
       text(msg);
+      break;
+    case "config":
+      if ("tileFilter" in msg) useTileFilter = !!msg.tileFilter;
       break;
   }
 };

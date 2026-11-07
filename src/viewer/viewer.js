@@ -18,15 +18,18 @@ import { buildTextLayer, placeTextLayer } from "./textlayer.js";
 
 const GAP = 10;
 const PAD = 12;
-export const MIN_ZOOM = 0.25;
+export const MIN_ZOOM = 0.05; // low enough to fit wall-sized maps and posters
 export const MAX_ZOOM = 8;
 const AUTO_MAX = 1.5;
 // Whole-page bitmaps are capped at this size (~64MB) and stretched beyond it.
-// Past the cap, a full-resolution "detail" bitmap covering just the visible
-// part of the page (plus a margin) is layered on top once scrolling pauses.
+// Past the cap, the page is covered by full-resolution tiles that render
+// continuously as you pan: visible tiles first (nearest the center), then a
+// prefetch ring around the viewport. Tiles are cached, so panning back is
+// instant, and the capped whole-page bitmap shows underneath while they fill in.
 const MAX_BITMAP_PIXELS = 16e6;
-const DETAIL_MARGIN = 0.35; // extra viewport fraction rendered around the visible area
-const DETAIL_SNAP = 256; // device px grid for detail rects, so small scrolls reuse them
+const TILE = 512; // device px
+const TILE_MARGIN = 0.5; // prefetch ring, as a fraction of the viewport per side
+const MAX_TILE_JOBS = 160;
 const MAX_BITMAP_SIDE = 16384;
 const SETTLE_MS = 180; // pinch idle time before the crisp re-render
 const TEXT_IDLE_MS = 120; // scroll idle time before building text layers
@@ -35,10 +38,7 @@ const BEHIND_VIEWPORTS = 1;
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const pageKey = (p) => `p${p}`;
-const detailKey = (p) => `d${p}`;
-// a: [x, y, w, h]; b: [x0, y0, x1, y1]
-const contains = (a, b) => a[0] <= b[0] && a[1] <= b[1] && a[0] + a[2] >= b[2] && a[1] + a[3] >= b[3];
-const intersects = (a, b) => a[0] < b[2] && a[1] < b[3] && a[0] + a[2] > b[0] && a[1] + a[3] > b[1];
+const tileKey = (p, fullW, tx, ty, inv) => `T${p}@${fullW}${inv ? "i" : ""}:${tx},${ty}`;
 
 export class Viewer extends EventTarget {
   constructor(scroller) {
@@ -69,7 +69,7 @@ export class Viewer extends EventTarget {
     this.lastScrollTop = 0;
     this.current = 0;
     this.gesture = null;
-    this.detailJobs = [];
+    this.tileSig = "";
     this.view = { top: 0, left: 0 };
     this.viewW = scroller.clientWidth;
     this.viewH = scroller.clientHeight;
@@ -235,8 +235,15 @@ export class Viewer extends EventTarget {
     if (changed) {
       for (const p of [...this.mounted.keys()]) if (p < ma || p > mb) this.#unmount(p);
       for (let p = ma; p <= mb; p++) if (!this.mounted.has(p)) this.#mount(p);
-      this.pool?.pump();
     }
+
+    // Tiles: when the set of tiles under the viewport changes (panning within
+    // a big page), mount cached ones and re-prioritize the render queue.
+    const tileSig = this.gesture ? this.tileSig : this.#tileSignature();
+    const tilesChanged = tileSig !== this.tileSig;
+    this.tileSig = tileSig;
+    if (tilesChanged) for (const p of this.mounted.keys()) this.#syncTiles(p);
+    if (changed || tilesChanged) this.pool?.pump();
 
     // Text layers wait until scrolling pauses.
     clearTimeout(this.textTimer);
@@ -250,18 +257,17 @@ export class Viewer extends EventTarget {
   }
 
   #mount(p) {
-    const m = { div: this.divs[p], entry: null, text: null, cancelText: null };
+    const m = { div: this.divs[p], entry: null, text: null, cancelText: null, tiles: new Map() };
     this.mounted.set(p, m);
     const e = this.cache.touch(pageKey(p));
     if (e) this.#attach(p, m, e);
-    const d = this.cache.touch(detailKey(p));
-    if (d && d.invert === this.invert) this.#attachDetail(m, d);
+    this.#syncTiles(p);
   }
 
   #unmount(p) {
     const m = this.mounted.get(p);
     m.entry?.canvas.remove();
-    m.detail?.canvas.remove();
+    for (const t of m.tiles.values()) t.canvas.remove();
     m.cancelText?.();
     m.text?.el.remove();
     this.mounted.delete(p);
@@ -294,13 +300,8 @@ export class Viewer extends EventTarget {
     for (let p = a; p <= b; p++) visible.push(p);
     visible.sort((x, y) => Math.abs(x - this.current) - Math.abs(y - this.current));
     visible.forEach(add);
-    // Full-resolution detail for visible pages past the bitmap cap.
-    for (const job of this.detailJobs) {
-      const p = job.page - 1;
-      if (p < a || p > b || job.invert !== this.invert || job.width !== this.#fullSize(p).w) continue;
-      const vr = this.#visibleDeviceRect(p, 0);
-      if (vr && intersects(job.crop, vr)) jobs.push(job);
-    }
+    // Full-resolution tiles for visible pages past the bitmap cap.
+    for (let p = a; p <= b; p++) this.#tileJobs(p, jobs);
     if (this.dir > 0) {
       for (let p = b + 1; p <= mb; p++) add(p);
       for (let p = a - 1; p >= ma; p--) add(p);
@@ -314,7 +315,7 @@ export class Viewer extends EventTarget {
 
   onRendered(job, bitmap) {
     if (job.kind === "thumb") return this.thumbs?.onRendered(job, bitmap);
-    if (job.kind === "detail") return this.#onDetail(job, bitmap);
+    if (job.kind === "tile") return this.#onTile(job, bitmap);
     const p = job.page - 1;
     const t = this.targetSize(p);
     const fits = (w, h, inv) => w === t.w && h === t.h && inv === this.invert;
@@ -333,7 +334,7 @@ export class Viewer extends EventTarget {
     const keep = new Set();
     for (const [p, m] of this.mounted) {
       keep.add(pageKey(p));
-      if (m.detail) keep.add(detailKey(p));
+      for (const k of m.tiles.keys()) keep.add(k);
     }
     if (this.thumbs) for (const k of this.thumbs.mountedKeys()) keep.add(k);
     return keep;
@@ -540,14 +541,8 @@ export class Viewer extends EventTarget {
     // so the toggle is instant.
     for (const m of this.mounted.values()) {
       if (m.entry) m.div.classList.toggle("inv-pending", m.entry.invert !== on);
-      if (m.detail && m.detail.invert !== on) {
-        m.detail.canvas.remove();
-        m.detail = null;
-      }
     }
-    this.detailJobs = [];
-    clearTimeout(this.textTimer);
-    this.textTimer = setTimeout(() => this.#onIdle(), TEXT_IDLE_MS);
+    for (const p of this.mounted.keys()) this.#syncTiles(p);
     this.thumbs?.setInvert(on);
     this.pool?.pump();
   }
@@ -567,15 +562,19 @@ export class Viewer extends EventTarget {
     return t;
   }
 
-  // ---- high-zoom detail ----------------------------------------------------------
+  // ---- high-zoom tiles -------------------------------------------------------------
 
   #fullSize(p) {
     return { w: Math.round(this.w[p] * this.dpr), h: Math.round(this.h[p] * this.dpr) };
   }
 
-  // Visible part of page p in full-resolution device px, as [x0, y0, x1, y1],
-  // optionally grown by a fraction of the viewport. Uses the scroll offsets
-  // cached by update() so it never forces layout.
+  #needsTiles(p) {
+    return this.targetSize(p).w < this.#fullSize(p).w;
+  }
+
+  // Part of page p under the viewport (grown by `margin` viewports per side),
+  // in full-resolution device px: [x0, y0, x1, y1]. Uses the scroll offsets
+  // cached by update(), so it never forces layout.
   #visibleDeviceRect(p, margin) {
     const mx = this.viewW * margin;
     const my = this.viewH * margin;
@@ -585,57 +584,127 @@ export class Viewer extends EventTarget {
     const y1 = Math.min(this.h[p], this.view.top + this.viewH + my - this.tops[p]);
     if (x1 <= x0 || y1 <= y0) return null;
     const d = this.dpr;
-    return [Math.floor(x0 * d), Math.floor(y0 * d), Math.ceil(x1 * d), Math.ceil(y1 * d)];
+    return [x0 * d, y0 * d, x1 * d, y1 * d];
   }
 
-  // Runs once scrolling/zooming pauses: decide which visible pages need a
-  // detail render, and build text layers.
-  #onIdle() {
-    if (this.gesture) return;
-    this.#buildVisibleText();
-    const jobs = [];
+  // Inclusive tile index range [tx0, ty0, tx1, ty1] covering that rect.
+  #tileRange(p, margin) {
+    const r = this.#visibleDeviceRect(p, margin);
+    if (!r) return null;
+    return [Math.floor(r[0] / TILE), Math.floor(r[1] / TILE), Math.ceil(r[2] / TILE) - 1, Math.ceil(r[3] / TILE) - 1];
+  }
+
+  #tileSignature() {
+    let sig = "";
     const [a, b] = this.vis;
     for (let p = a; p <= b; p++) {
-      const full = this.#fullSize(p);
-      if (this.targetSize(p).w >= full.w) continue; // base bitmap is already full-res
-      const vr = this.#visibleDeviceRect(p, 0);
-      if (!vr) continue;
-      const e = this.cache.get(detailKey(p));
-      if (e && e.fullW === full.w && e.invert === this.invert && contains(e.crop, vr)) continue;
-      const r = this.#visibleDeviceRect(p, DETAIL_MARGIN);
-      const x0 = Math.floor(r[0] / DETAIL_SNAP) * DETAIL_SNAP;
-      const y0 = Math.floor(r[1] / DETAIL_SNAP) * DETAIL_SNAP;
-      const x1 = Math.min(full.w, Math.ceil(r[2] / DETAIL_SNAP) * DETAIL_SNAP);
-      const y1 = Math.min(full.h, Math.ceil(r[3] / DETAIL_SNAP) * DETAIL_SNAP);
-      jobs.push({ key: detailKey(p), page: p + 1, width: full.w, height: full.h, crop: [x0, y0, x1 - x0, y1 - y0], invert: this.invert, kind: "detail" });
+      if (!this.#needsTiles(p)) continue;
+      const r = this.#tileRange(p, 0);
+      if (r) sig += `${p}@${this.#fullSize(p).w}:${r};`;
     }
-    this.detailJobs = jobs;
-    if (jobs.length) this.pool?.pump();
+    return sig;
   }
 
-  #onDetail(job, bitmap) {
-    const p = job.page - 1;
-    if (job.width !== this.#fullSize(p).w || job.invert !== this.invert) {
-      bitmap.close(); // zoom or invert changed while rendering
-      return;
+  // Appends render jobs for page p's missing tiles: visible ones nearest the
+  // viewport center first, then the prefetch ring.
+  #tileJobs(p, jobs) {
+    if (!this.#needsTiles(p)) return;
+    const inner = this.#tileRange(p, 0);
+    const outer = this.#tileRange(p, TILE_MARGIN);
+    if (!inner || !outer) return;
+    const full = this.#fullSize(p);
+    const r = this.#visibleDeviceRect(p, 0);
+    const cx = (r[0] + r[2]) / 2 / TILE - 0.5;
+    const cy = (r[1] + r[3]) / 2 / TILE - 0.5;
+    const list = [];
+    for (let ty = outer[1]; ty <= outer[3]; ty++) {
+      for (let tx = outer[0]; tx <= outer[2]; tx++) {
+        const key = tileKey(p, full.w, tx, ty, this.invert);
+        if (this.cache.get(key)) continue;
+        const visible = tx >= inner[0] && tx <= inner[2] && ty >= inner[1] && ty <= inner[3];
+        // Visible tiles always outrank the ring; within each, nearest first.
+        const rank = (visible ? 0 : 1e6) + (tx - cx) ** 2 + (ty - cy) ** 2;
+        const x = tx * TILE;
+        const y = ty * TILE;
+        list.push({
+          rank,
+          job: { key, page: p + 1, width: full.w, height: full.h, crop: [x, y, Math.min(TILE, full.w - x), Math.min(TILE, full.h - y)], invert: this.invert, kind: "tile" },
+        });
+      }
     }
-    this.detailJobs = this.detailJobs.filter((j) => j.key !== job.key);
-    const e = this.cache.put(job.key, bitmap, { page: p, invert: job.invert, crop: job.crop, fullW: job.width, fullH: job.height });
-    const m = this.mounted.get(p);
-    if (m) this.#attachDetail(m, e);
+    list.sort((u, v) => u.rank - v.rank);
+    for (const { job } of list.slice(0, MAX_TILE_JOBS)) jobs.push(job);
+  }
+
+  #onTile(job, bitmap) {
+    const p = job.page - 1;
+    this.cache.put(job.key, bitmap, { page: p, invert: job.invert, crop: job.crop, fullW: job.width, fullH: job.height });
+    if (this.mounted.has(p)) this.#syncTiles(p);
     this.cache.evict(this.protectedKeys());
   }
 
-  // Positioned in percentages of the page box, so a detail from a previous
-  // zoom level stays correctly placed (just stretched) until replaced.
-  #attachDetail(m, e) {
-    if (m.detail && m.detail !== e) m.detail.canvas.remove();
-    m.detail = e;
+  // Makes page p's mounted tiles match the cache: mount cached current-scale
+  // tiles in the prefetch ring, drop ones that left it, and keep tiles from a
+  // previous zoom level underneath (stretched) until the current level fully
+  // covers the visible area.
+  #syncTiles(p) {
+    const m = this.mounted.get(p);
+    if (!m) return;
+    const inv = this.invert;
+    if (!this.#needsTiles(p)) {
+      for (const t of m.tiles.values()) t.canvas.remove();
+      m.tiles.clear();
+      return;
+    }
+    const full = this.#fullSize(p);
+    const outer = this.#tileRange(p, TILE_MARGIN);
+    const inner = this.#tileRange(p, 0);
+    let covered = true;
+    if (outer) {
+      for (let ty = outer[1]; ty <= outer[3]; ty++) {
+        for (let tx = outer[0]; tx <= outer[2]; tx++) {
+          const key = tileKey(p, full.w, tx, ty, inv);
+          const e = m.tiles.get(key) || this.cache.touch(key);
+          if (e) {
+            if (!m.tiles.has(key)) this.#mountTile(m, e);
+          } else if (inner && tx >= inner[0] && tx <= inner[2] && ty >= inner[1] && ty <= inner[3]) {
+            covered = false;
+          }
+        }
+      }
+    }
+    for (const [key, e] of m.tiles) {
+      let keep;
+      if (e.fullW === full.w && e.invert === inv) {
+        const tx = e.crop[0] / TILE;
+        const ty = e.crop[1] / TILE;
+        keep = !!outer && tx >= outer[0] && tx <= outer[2] && ty >= outer[1] && ty <= outer[3];
+      } else {
+        keep = !covered && e.invert === inv;
+        e.canvas.classList.add("stale");
+      }
+      if (!keep) {
+        e.canvas.remove();
+        m.tiles.delete(key);
+      }
+    }
+  }
+
+  // Positioned in percentages of the page box, so a tile from a previous zoom
+  // level stays correctly placed (just stretched) until replaced.
+  #mountTile(m, e) {
     const [x, y, w, h] = e.crop;
     const c = e.canvas;
-    c.className = "detail";
+    c.className = "tile";
     c.style.cssText = `left:${(x / e.fullW) * 100}%;top:${(y / e.fullH) * 100}%;width:${(w / e.fullW) * 100}%;height:${(h / e.fullH) * 100}%`;
-    if (c.parentNode !== m.div) m.div.insertBefore(c, m.text ? m.text.el : null);
+    m.div.insertBefore(c, m.text ? m.text.el : null);
+    m.tiles.set(e.key, e);
+  }
+
+  // Runs once scrolling/zooming pauses.
+  #onIdle() {
+    if (this.gesture) return;
+    this.#buildVisibleText();
   }
 
   #buildVisibleText() {
